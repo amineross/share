@@ -1,0 +1,11 @@
+#!@SHELL@
+PATH=@PREFIX@/usr/bin:@PREFIX@/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# Restart misd with Share so Settings shows Personal Hotspot right away.
+# Older launchctl builds have no kickstart, and a killed misd stays down
+# until something starts it.
+launchctl kickstart -k system/com.apple.MobileInternetSharing 2>/dev/null || {
+    killall misd 2>/dev/null
+    sleep 1
+    launchctl start com.apple.MobileInternetSharing 2>/dev/null
+}
+exit 0

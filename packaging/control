@@ -1,0 +1,16 @@
+Package: com.rostane.share
+Name: Share
+Version: @PACKAGE_VERSION@
+Architecture: @ARCH@
+Section: Tweaks
+Maintainer: Amine Rostane <amine.rostane@outlook.com>
+Author: Amine Rostane <amine.rostane@outlook.com>
+Depends: firmware (>= @MINIMUM_OS@), mobilesubstrate
+Homepage: https://github.com/amineross/share
+Icon: https://aminerostane.com/repo/icons/share.png
+Depiction: https://aminerostane.com/repo/depictions/share.html
+SileoDepiction: https://aminerostane.com/repo/depictions/share.json
+Description: Personal Hotspot without a SIM.
+ Share gives a jailbroken iPhone or iPad Personal Hotspot without a SIM.
+ Install it, open Settings and you should see Personal Hotspot available.
+ 5 GHz automatically on supported hardware.

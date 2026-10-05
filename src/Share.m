@@ -1,0 +1,429 @@
+/* Share: Apple's Personal Hotspot without a SIM.
+ *
+ * In misd it removes the cellular requirement and asks for Apple's local
+ * network mode with DHCP; Apple still creates the network. In wifid, on
+ * releases with a fixed 2.4 GHz hotspot channel list, it offers 5 GHz
+ * channels when the Wi-Fi driver allows them here.
+ *
+ * Anything unrecognized is left untouched. When something goes wrong, a
+ * report is written once to Documents/Share-Report.json. */
+#import <Foundation/Foundation.h>
+#include <objc/runtime.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
+#include <mach/mach.h>
+#include <libkern/OSCacheControl.h>
+#include <CommonCrypto/CommonDigest.h>
+#include <dlfcn.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <ifaddrs.h>
+#include <unistd.h>
+#include <stdatomic.h>
+#include "share_support.h"
+
+#ifndef SHARE_VERSION
+#error "SHARE_VERSION is set by build.sh"
+#endif
+
+#define SHARE_DIR "/var/mobile/Library/Share"
+#define SHARE_REPORTED SHARE_DIR "/reported"
+#define SHARE_RADIO SHARE_DIR "/radio.json"
+#define SHARE_REPORT "/var/mobile/Documents/Share-Report.json"
+#define MIS_KEY CFSTR("com.apple.MobileInternetSharing")
+#define MIS_STATE_RESETTING 1021
+#define MOBILE_UID 501
+
+extern const char *getprogname(void);
+
+static dispatch_queue_t queue;
+
+/* ── System configuration store ───────────────────────────────────
+ * Private on iOS, so resolved at runtime. misd publishes the hotspot state
+ * here; Settings shows Personal Hotspot when State > 1021. */
+typedef void (*store_callback)(CFTypeRef, CFArrayRef, void *);
+static CFTypeRef store;
+static CFPropertyListRef (*store_copy)(CFTypeRef, CFStringRef);
+
+static void watch_store(store_callback callback) {
+    void *sc = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_NOW);
+    CFTypeRef (*create)(CFAllocatorRef, CFStringRef, store_callback, void *) = sc ? dlsym(sc, "SCDynamicStoreCreate") : NULL;
+    Boolean (*keys)(CFTypeRef, CFArrayRef, CFArrayRef) = sc ? dlsym(sc, "SCDynamicStoreSetNotificationKeys") : NULL;
+    Boolean (*dispatch)(CFTypeRef, dispatch_queue_t) = sc ? dlsym(sc, "SCDynamicStoreSetDispatchQueue") : NULL;
+    store_copy = sc ? dlsym(sc, "SCDynamicStoreCopyValue") : NULL;
+    store = create ? create(NULL, CFSTR("Share"), callback, NULL) : NULL;
+    if (!store || !keys || !dispatch) return;
+    keys(store, (__bridge CFArrayRef)@[(__bridge NSString *)MIS_KEY], NULL);
+    dispatch(store, queue);
+}
+
+static NSDictionary *hotspot_state(void) {
+    id value = store && store_copy ? CFBridgingRelease(store_copy(store, MIS_KEY)) : nil;
+    return [value isKindOfClass:[NSDictionary class]] ? value : @{};
+}
+
+/* ── Hooking framework ─────────────────────────────────────────────
+ * Substrate, libhooker and ElleKit each expose some of these. */
+static NSString *patch_method = @"none", *hook_method = @"none";
+
+static void *hook_symbol(const char *name) {
+    static const char *libraries[] = {
+        "/usr/lib/libellekit.dylib", "/var/jb/usr/lib/libellekit.dylib",
+        "/usr/lib/libsubstrate.dylib", "/var/jb/usr/lib/libsubstrate.dylib",
+        "/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
+        "/var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
+        "/usr/lib/libhooker.dylib", "/var/jb/usr/lib/libhooker.dylib",
+        "/usr/lib/libsubstitute.dylib", "/var/jb/usr/lib/libsubstitute.dylib", NULL};
+    void *symbol = dlsym(RTLD_DEFAULT, name);
+    for (const char **path = libraries; !symbol && *path; path++) {
+        if (access(*path, R_OK)) continue;
+        void *library = dlopen(*path, RTLD_NOW);
+        if (library) symbol = dlsym(library, name);
+    }
+    return symbol;
+}
+
+static BOOL write_instruction(void *address, uint32_t value) {
+    struct { void *destination; const void *data; size_t size; void *options; } patch = {address, &value, sizeof value, NULL};
+    void (*ms_memory)(void *, const void *, size_t) = hook_symbol("MSHookMemory");
+    int (*lh_memory)(void *, int) = hook_symbol("LHPatchMemory");
+    if (ms_memory) ms_memory(address, &value, sizeof value);
+    if (*(volatile uint32_t *)address == value) { patch_method = @"MSHookMemory"; return YES; }
+    if (lh_memory) lh_memory(&patch, 1);
+    if (*(volatile uint32_t *)address == value) { patch_method = @"LHPatchMemory"; return YES; }
+    vm_address_t page = (vm_address_t)address & ~(vm_address_t)(vm_page_size - 1);
+    if (vm_protect(mach_task_self(), page, vm_page_size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS)
+        return NO;
+    *(volatile uint32_t *)address = value;
+    sys_icache_invalidate(address, sizeof value);
+    vm_protect(mach_task_self(), page, vm_page_size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+    if (*(volatile uint32_t *)address != value) return NO;
+    patch_method = @"vm_protect";
+    return YES;
+}
+
+static BOOL hook_function(void *target, void *replacement, void **original) {
+    struct { void *function, *replacement, *original, *options; } hook = {target, replacement, original, NULL};
+    void (*ms_function)(void *, void *, void **) = hook_symbol("MSHookFunction");
+    int (*lh_functions)(void *, int) = hook_symbol("LHHookFunctions");
+    if (ms_function) ms_function(target, replacement, original);
+    if (*original) { hook_method = @"MSHookFunction"; return YES; }
+    if (lh_functions && lh_functions(&hook, 1) == 1 && *original) { hook_method = @"LHHookFunctions"; return YES; }
+    return NO;
+}
+
+/* ── Shared files ──────────────────────────────────────────────────
+ * Written by root daemons, owned by mobile so Filza and Files can read them. */
+static void write_mobile_file(const char *path, NSData *data) {
+    mkdir(SHARE_DIR, 0755);
+    chown(SHARE_DIR, MOBILE_UID, MOBILE_UID);
+    if (![data writeToFile:@(path) atomically:YES]) return;
+    chown(path, MOBILE_UID, MOBILE_UID);
+    chmod(path, 0644);
+}
+
+static NSData *json(id object) {
+    return [NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingPrettyPrinted error:NULL];
+}
+
+/* ════════════════════════════════════════════════════════════════
+ * misd
+ * ════════════════════════════════════════════════════════════════ */
+struct share_ct_status {
+    _Bool carrier, auth, available;
+    unsigned max_hosts;
+    struct { int state, index; char name[16]; } conn;
+};
+
+static int (*ct_original)(id, SEL, struct share_ct_status *);
+static uint64_t (*mode_original)(void *, const char *);
+static CFStringRef (*sim_status)(void);
+static CFStringRef *sim_ready;
+static _Atomic int local_mode, tethering_result = -1;
+static BOOL compatible, ct_backend;
+static NSString *failure = @"", *signature = @"absent";
+static NSMutableDictionary *binary;
+
+/* No usable SIM: none, locked, or no baseband at all (Wi-Fi-only models
+ * report no status). */
+static int sim_unusable(void) {
+    CFStringRef status = sim_status ? sim_status() : NULL;
+    return !status || !sim_ready || !*sim_ready || !CFEqual(status, *sim_ready);
+}
+
+/* Without cellular service the query reports no connection, or fails on
+ * Wi-Fi-only models. Both are the local case. */
+static int ct_status(id self, SEL cmd, struct share_ct_status *s) {
+    int result = ct_original(self, cmd, s);
+    atomic_store(&tethering_result, result);
+    if (!s) return result;
+    int local = result != 0 || (!s->available && !s->conn.name[0]);
+    atomic_store(&local_mode, local);
+    if (!local || !compatible) return result;
+    s->carrier = 1;
+    s->auth = 1;
+    return 0;
+}
+
+static uint64_t mode_get(void *dictionary, const char *key) {
+    uint64_t value = mode_original(dictionary, key);
+    if (!key || strcmp(key, "opMode") || (value != 200 && value != 201)) return value;
+    int local = ct_backend ? atomic_load(&local_mode) : sim_unusable();
+    if (!ct_backend) atomic_store(&local_mode, local);
+    return share_local_mode(key, value, local, compatible);
+}
+
+static const struct mach_header_64 *main_image(NSString **path) {
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header *h = _dyld_get_image_header(i);
+        if (h && h->magic == MH_MAGIC_64 && h->filetype == MH_EXECUTE) {
+            if (path) *path = @(_dyld_get_image_name(i));
+            return (const void *)h;
+        }
+    }
+    return NULL;
+}
+
+static NSString *image_uuid(const struct mach_header_64 *header) {
+    const uint8_t *cursor = (const uint8_t *)(header + 1), *end = cursor + header->sizeofcmds;
+    for (uint32_t i = 0; i < header->ncmds && cursor + sizeof(struct load_command) <= end; i++) {
+        const struct load_command *command = (const void *)cursor;
+        if (command->cmdsize < sizeof *command || cursor + command->cmdsize > end) break;
+        if (command->cmd == LC_UUID && command->cmdsize >= sizeof(struct uuid_command))
+            return [[NSUUID alloc] initWithUUIDBytes:((const struct uuid_command *)cursor)->uuid].UUIDString;
+        cursor += command->cmdsize;
+    }
+    return @"unknown";
+}
+
+static void install(void) {
+    NSString *path = @"";
+    const struct mach_header_64 *header = main_image(&path);
+    unsigned long size = 0;
+    uint8_t *text = header ? getsegmentdata(header, "__TEXT", &size) : NULL;
+    size_t site = 0;
+    int destination = 0;
+    unsigned sites = text ? share_patch_sites((const uint32_t *)text, size / 4, &site, &destination) : 0;
+    unsigned tables = text ? share_mode_tables(text, size) : 0;
+    BOOL local_dhcp = text && tables == 1 && share_contains(text, size, "opMode") &&
+        (share_contains(text, size, "local with dhcp mode") || share_contains(text, size, "local_with_dhcp_mode"));
+    binary = [@{@"path": path, @"uuid": header ? image_uuid(header) : @"unknown",
+                @"cpu": header ? @[@(header->cputype), @(header->cpusubtype & 0xff)] : @[],
+                @"stateGateMatches": @(sites), @"modeTables": @(tables), @"localDHCPMode": @(local_dhcp)} mutableCopy];
+    if (sites == 1) {
+        binary[@"stateGateOffset"] = @((uintptr_t)(text + site * 4) - (uintptr_t)header);
+        binary[@"stateGateInstruction"] = @(((uint32_t *)text)[site]);
+    }
+
+    void *telephony = dlopen("/System/Library/Frameworks/CoreTelephony.framework/CoreTelephony", RTLD_NOW);
+    sim_status = telephony ? dlsym(telephony, "CTSIMSupportGetSIMStatus") : NULL;
+    sim_ready = telephony ? dlsym(telephony, "kCTSIMSupportSIMStatusReady") : NULL;
+    Class client = objc_getClass("misCTClientSharedInstance");
+    Method method = client ? class_getInstanceMethod(client, sel_registerName("getTetheringStatus:")) : NULL;
+    const char *types = method ? method_getTypeEncoding(method) : NULL;
+    if (types) signature = @(types);
+    ct_backend = client != Nil;
+    BOOL permission = ct_backend ? share_tethering_signature(types) : (sim_status && sim_ready);
+    void *mode_lookup = dlsym(RTLD_DEFAULT, "xpc_dictionary_get_uint64");
+
+    if (!header || header->cputype != CPU_TYPE_ARM64) { failure = @"Unsupported processor"; return; }
+    if (sites != 1) { failure = @"Hotspot state gate not found"; return; }
+    if (!local_dhcp) { failure = @"Local hotspot mode not found"; return; }
+    if (!permission) { failure = @"Cellular check not recognized"; return; }
+    if (!mode_lookup) { failure = @"Hotspot mode lookup not found"; return; }
+    if (!write_instruction(text + site * 4, share_patched_instruction(destination))) { failure = @"Could not patch misd"; return; }
+    if (!hook_function(mode_lookup, (void *)mode_get, (void **)&mode_original)) { failure = @"Hooking framework unavailable"; return; }
+    if (ct_backend) ct_original = (void *)method_setImplementation(method, (IMP)ct_status);
+    compatible = !ct_backend || ct_original != NULL;
+    if (!compatible) failure = @"Could not adapt the cellular check";
+}
+
+/* ── Report ───────────────────────────────────────────────────────
+ * One per kind of problem, misd build and Share version. */
+static NSString *sysctl_string(const char *key) {
+    char buffer[256] = {0};
+    size_t size = sizeof buffer;
+    return sysctlbyname(key, buffer, &size, NULL, 0) == 0 ? @(buffer) : @"unavailable";
+}
+
+static NSString *sha256(NSString *path) {
+    NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:NULL];
+    if (!data) return @"unavailable";
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    NSMutableString *hex = [NSMutableString string];
+    for (unsigned i = 0; i < sizeof digest; i++) [hex appendFormat:@"%02x", digest[i]];
+    return hex;
+}
+
+static NSDictionary *interfaces(void) {
+    NSMutableDictionary *found = [NSMutableDictionary dictionary];
+    struct ifaddrs *list = NULL;
+    if (getifaddrs(&list) != 0) return found;
+    for (struct ifaddrs *i = list; i; i = i->ifa_next) {
+        if (strcmp(i->ifa_name, "ap1") && strcmp(i->ifa_name, "bridge100")) continue;
+        NSMutableDictionary *entry = found[@(i->ifa_name)] ?: [@{@"up": @((i->ifa_flags & IFF_UP) != 0), @"ipv4": @NO} mutableCopy];
+        if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET) entry[@"ipv4"] = @YES;
+        found[@(i->ifa_name)] = entry;
+    }
+    freeifaddrs(list);
+    return found;
+}
+
+static NSArray *hotspot_classes(void) {
+    NSMutableArray *classes = [NSMutableArray array];
+    unsigned count = 0;
+    Class *all = objc_copyClassList(&count);
+    for (unsigned i = 0; i < count; i++) {
+        const char *name = class_getName(all[i]);
+        if (strncasecmp(name, "mis", 3)) continue;
+        unsigned methods_count = 0;
+        Method *methods = class_copyMethodList(all[i], &methods_count);
+        NSMutableArray *list = [NSMutableArray array];
+        for (unsigned j = 0; j < methods_count; j++) {
+            const char *types = method_getTypeEncoding(methods[j]);
+            [list addObject:[NSString stringWithFormat:@"%s %s", sel_getName(method_getName(methods[j])), types ?: ""]];
+        }
+        free(methods);
+        [classes addObject:@{@"class": @(name), @"methods": list}];
+    }
+    free(all);
+    return classes;
+}
+
+static void report(NSString *kind, NSString *detail) {
+    NSString *key = [NSString stringWithFormat:@"%@ %@ %@", binary[@"uuid"] ?: @"unknown", @SHARE_VERSION, kind];
+    NSString *reported = [NSString stringWithContentsOfFile:@SHARE_REPORTED encoding:NSUTF8StringEncoding error:NULL] ?: @"";
+    if ([[reported componentsSeparatedByString:@"\n"] containsObject:key]) return;
+    write_mobile_file(SHARE_REPORTED, [[reported stringByAppendingFormat:@"%@\n", key] dataUsingEncoding:NSUTF8StringEncoding]);
+
+    NSMutableDictionary *hotspot = [hotspot_state() mutableCopy];
+    [hotspot removeObjectsForKeys:@[@"ExternalInterfaces", @"InternalInterfaces"]];
+    NSMutableDictionary *misd = [binary mutableCopy] ?: [NSMutableDictionary dictionary];
+    misd[@"sha256"] = sha256(misd[@"path"] ?: @"");
+    id radio = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:@SHARE_RADIO] ?: [NSData data] options:0 error:NULL];
+    NSDictionary *bootpd = [NSDictionary dictionaryWithContentsOfFile:@"/Library/Preferences/SystemConfiguration/bootpd.plist"];
+    NSDictionary *contents = @{
+        @"problem": kind, @"detail": detail, @"share": @SHARE_VERSION, @"date": NSDate.date.description,
+        @"device": @{@"model": sysctl_string("hw.machine"), @"build": sysctl_string("kern.osversion"),
+                     @"iOS": NSProcessInfo.processInfo.operatingSystemVersionString,
+                     @"rootless": @(access("/var/jb", F_OK) == 0)},
+        @"misd": misd,
+        @"engine": @{@"compatible": @(compatible), @"failure": failure,
+                     @"cellularCheck": ct_backend ? @"CoreTelephony" : @"SIM status",
+                     @"tetheringStatusSignature": signature, @"tetheringStatusResult": @(atomic_load(&tethering_result)),
+                     @"localMode": @(atomic_load(&local_mode)), @"patch": patch_method, @"hook": hook_method,
+                     @"hookFrameworks": @{@"MSHookFunction": @(hook_symbol("MSHookFunction") != NULL),
+                                          @"MSHookMemory": @(hook_symbol("MSHookMemory") != NULL),
+                                          @"LHHookFunctions": @(hook_symbol("LHHookFunctions") != NULL)}},
+        @"hotspot": hotspot, @"interfaces": interfaces(), @"radio": radio ?: @{},
+        @"dhcp": @{@"configured": @(bootpd != nil), @"enabled": [bootpd[@"dhcp_enabled"] description] ?: @"absent"},
+        @"hotspotClasses": hotspot_classes(),
+        @"privacy": @"No passwords, network names, MAC addresses, client names or cellular identifiers."};
+    write_mobile_file(SHARE_REPORT, json(contents));
+}
+
+/* Settings shows Personal Hotspot only from State > 1021; misd also
+ * publishes an error number when the hotspot fails. */
+static BOOL check_pending;
+
+static void check_hotspot(void) {
+    check_pending = NO;
+    NSDictionary *state = hotspot_state();
+    if (!state.count) return;
+    if ([state[@"State"] intValue] <= MIS_STATE_RESETTING)
+        report(@"hotspot unavailable", [NSString stringWithFormat:@"misd stays in state %@", state[@"State"]]);
+    else if ([state[@"Errnum"] intValue] != 0)
+        report(@"hotspot error", [NSString stringWithFormat:@"misd reported error %@", state[@"Errnum"]]);
+}
+
+static void misd_state_changed(CFTypeRef s, CFArrayRef keys, void *info) {
+    if (check_pending) return;
+    check_pending = YES;
+    /* Startup passes through the unavailable states; judge once settled. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), queue, ^{ @autoreleasepool { @try { check_hotspot(); } @catch (id e) {} } });
+}
+
+static void start_misd(void) {
+    @try { install(); }
+    @catch (id exception) { failure = [exception description] ?: @"Startup failed"; }
+    dispatch_async(queue, ^{
+        @autoreleasepool {
+            @try {
+                if (!compatible) { report(@"unsupported", failure); return; }
+                watch_store(misd_state_changed);
+                misd_state_changed(NULL, NULL, NULL);
+            } @catch (id exception) {}
+        }
+    });
+}
+
+/* ════════════════════════════════════════════════════════════════
+ * wifid
+ * ════════════════════════════════════════════════════════════════
+ * Older wifid starts the hotspot on one of {1, 6, 11}. The list lives in
+ * writable data, so it is swapped for 5 GHz channels the driver currently
+ * allows; newer wifid has no such list and picks the band itself. */
+struct apple80211req { char name[IFNAMSIZ]; int type; int value; uint32_t length; void *data; };
+struct apple80211_channels { uint32_t version, count; struct share_channel channels[64]; };
+#define SIOCGA80211 _IOWR('i', 201, struct apple80211req)
+#define APPLE80211_IOC_SUPPORTED_CHANNELS 27
+
+static uint32_t *channel_list;
+
+static unsigned driver_channels(struct apple80211_channels *result) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+    struct apple80211req request = {.name = "en0", .type = APPLE80211_IOC_SUPPORTED_CHANNELS,
+                                    .length = sizeof *result, .data = result};
+    memset(result, 0, sizeof *result);
+    result->version = 1;
+    int ok = ioctl(fd, SIOCGA80211, &request) == 0;
+    close(fd);
+    return ok ? MIN(result->count, 64u) : 0;
+}
+
+static void choose_band(void) {
+    struct apple80211_channels driver;
+    unsigned count = driver_channels(&driver);
+    uint32_t five[3];
+    unsigned picked = share_pick_5ghz(driver.channels, count, five);
+    memcpy(channel_list, picked ? five : share_stock_channels, sizeof share_stock_channels);
+    NSMutableArray *offered = [NSMutableArray array];
+    for (unsigned i = 0; i < count; i++) [offered addObject:@[@(driver.channels[i].channel), @(driver.channels[i].flags)]];
+    write_mobile_file(SHARE_RADIO, json(@{@"hotspotChannels": @[@(channel_list[0]), @(channel_list[1]), @(channel_list[2])],
+                                          @"driverChannels": offered}));
+}
+
+static void wifid_state_changed(CFTypeRef s, CFArrayRef keys, void *info) {
+    @autoreleasepool { @try { choose_band(); } @catch (id e) {} }
+}
+
+static void start_wifid(void) {
+    const struct mach_header_64 *header = main_image(NULL);
+    unsigned long size = 0;
+    uint8_t *data = header ? getsegmentdata(header, "__DATA", &size) : NULL;
+    size_t offset = 0;
+    if (!data || share_channel_lists(data, size, &offset) != 1) return;
+    channel_list = (uint32_t *)(data + offset);
+    dispatch_async(queue, ^{
+        /* The region can change after launch; recheck whenever the hotspot
+         * state does, before wifid starts the access point. */
+        watch_store(wifid_state_changed);
+        wifid_state_changed(NULL, NULL, NULL);
+    });
+}
+
+__attribute__((constructor)) static void share_init(void) {
+    const char *name = getprogname();
+    BOOL misd = !strcmp(name, "misd"), wifid = !strcmp(name, "wifid");
+    if (!misd && !wifid) return;
+    queue = dispatch_queue_create("com.rostane.share", DISPATCH_QUEUE_SERIAL);
+    @autoreleasepool {
+        if (misd) start_misd();
+        else start_wifid();
+    }
+}
