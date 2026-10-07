@@ -9,9 +9,9 @@ root = Path(__file__).resolve().parents[1]
 fixtures = Path(os.environ['SHARE_FIXTURES']) if 'SHARE_FIXTURES' in os.environ else None
 
 # release: (state gate offset, register) for misd; channel lists in wifid
-MISD = {'ios12': (0x1182c, 24), 'ios15': (0x120a8, 25), 'ios16': (0x141b4, 25),
+MISD = {'ios12': (0x1182c, 24), 'ios14ipad': (0x11bb8, 25), 'ios15': (0x120a8, 25), 'ios16': (0x141b4, 25),
         'ios17': (0x137d8, 25), 'ios17ipad': (0x14308, 25)}
-WIFID = {'ios12': 1, 'ios15': 0, 'ios16': 0, 'ios17': 0}
+WIFID = {'ios12': 1, 'ios14ipad': 0, 'ios15': 0, 'ios16': 0, 'ios17': 0}
 
 CHECK = r'''#include "share_support.h"
 #include <assert.h>
@@ -29,10 +29,20 @@ static void rules(void) {
     assert(share_patch_sites(w, 4, &site, &dest) == 2);
     assert(share_patch_sites(w, 0, &site, &dest) == 0);
     assert(share_patched_instruction(25) == 0x2a0003f9);
+    uint32_t gate[] = {0x0a190309, 0x6a08013f, 0x52807f88, 0x1a880509};
+    uint32_t patched[4];
+    assert(share_request_sites(gate, 4, &site, patched) == 1 && site == 0);
+    assert(patched[0] == 0x6a080309 && patched[1] == 0x52807f88 && patched[2] == 0x0b090509 && patched[3] == 0xd503201f);
+    gate[3] = 0x1a881509;
+    assert(share_request_sites(gate, 4, &site, patched) == 0);
     assert(share_tethering_signature(sig));
     assert(!share_tethering_signature("v24@0:8^{mis_ctinterface_tethering_status=BBBI{mis_ctinterface_ct_conn_status=ii[16c]}}16"));
     assert(!share_tethering_signature("i24@0:8^{mis_ctinterface_tethering_status=BBBQ{mis_ctinterface_ct_conn_status=ii[16c]}}16"));
     assert(!share_tethering_signature(NULL));
+    assert(share_data_plan_signature("i24@0:8^B16"));
+    assert(!share_data_plan_signature("v24@0:8^B16"));
+    assert(!share_data_plan_signature("i24@0:8@16"));
+    assert(!share_data_plan_signature(NULL));
 
     uint32_t out[3];
     struct share_channel all[] = {{1, 6, 0x0a}, {1, 36, 0x12}, {1, 40, 0x12}, {1, 44, 0x12}, {1, 52, 0x112}};
@@ -51,7 +61,9 @@ int main(int argc, char **argv) {
     if (argv[1][0] == 'w') { size_t offset; printf("%u\n", share_channel_lists(b, n, &offset)); return 0; }
     size_t site = 0; int dest = 0;
     unsigned count = share_patch_sites(b, n / 4, &site, &dest);
-    printf("%u %zu %d %u %d\n", count, site * 4, dest, share_mode_tables(b, n), share_contains(b, n, "opMode"));
+    size_t request = 0; uint32_t patched[4] = {0};
+    unsigned requests = share_request_sites(b, n / 4, &request, patched);
+    printf("%u %zu %d %u %d %u %zu %u\n", count, site * 4, dest, share_mode_tables(b, n), share_contains(b, n, "opMode"), requests, request * 4, patched[2]);
     return 0;
 }'''
 
@@ -68,7 +80,8 @@ with tempfile.TemporaryDirectory() as tmp:
         if not path or not path.exists():
             print('SKIP', release, 'misd'); continue
         values = list(map(int, run('m', path)))
-        assert values == [1, offset, register, 1, 1], (release, values)
+        assert values[:5] == [1, offset, register, 1, 1], (release, values)
+        print('    request gate', values[5], hex(values[6]) if values[5] else '')
         doubled = tmp / 'doubled'
         doubled.write_bytes(path.read_bytes() + struct.pack('<4I', 201, 201, 202, 203))
         assert run('m', doubled)[3] == b'2'

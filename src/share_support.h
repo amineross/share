@@ -34,6 +34,40 @@ static uint32_t share_patched_instruction(int destination) {
     return 0x2a0003e0u | (uint32_t)destination;
 }
 
+/* iOS 14's second gate: misd leaves RESET (1020) for AUTH_UNKNOWN (1021) only
+ * when a client asked for authorization, and the carrier's answer then moves
+ * it to OFF (1022). Wi-Fi-only models have no client and no carrier.
+ *   and  wD, wAVAILABLE, wREQUESTED
+ *   tst  wD, wC
+ *   mov  wX, #0x3fc
+ *   cinc wY, wX, ne
+ * The rewrite drops the request and lands on OFF when tethering is available:
+ *   ands wD, wAVAILABLE, wC
+ *   mov  wX, #0x3fc
+ *   add  wY, wX, wD, lsl #1
+ *   nop */
+static unsigned share_request_sites(const uint32_t *w, size_t count, size_t *site, uint32_t patched[4]) {
+    unsigned found = 0;
+    for (size_t i = 0; i + 3 < count; i++) {
+        uint32_t and = w[i], tst = w[i + 1], cinc = w[i + 3];
+        int x;
+        if ((and & 0xffe0fc00u) != 0x0a000000u) continue;
+        int d = and & 31, n = (and >> 5) & 31;
+        if ((tst & 0xffe0fc1fu) != 0x6a00001fu || (int)((tst >> 5) & 31) != d) continue;
+        if (!share_reset_load(w[i + 2], &x) || x == d) continue;
+        if ((cinc & 0xffe0fc00u) != 0x1a800400u || (int)((cinc >> 16) & 31) != x ||
+            (int)((cinc >> 5) & 31) != x) continue;
+        uint32_t c = (tst >> 16) & 31, y = cinc & 31;
+        *site = i;
+        patched[0] = 0x6a000000u | (c << 16) | ((uint32_t)n << 5) | (uint32_t)d;
+        patched[1] = w[i + 2];
+        patched[2] = 0x0b000400u | ((uint32_t)d << 16) | ((uint32_t)x << 5) | y;
+        patched[3] = 0xd503201fu;
+        found++;
+    }
+    return found;
+}
+
 /* misd's operating-mode table; 203 is Apple's local network with DHCP. */
 static unsigned share_mode_tables(const void *bytes, size_t size) {
     const uint32_t table[] = {201, 201, 202, 203};
@@ -62,6 +96,11 @@ static int share_tethering_signature(const char *sig) {
     static const char shape[] =
         "^{mis_ctinterface_tethering_status=BBBI{mis_ctinterface_ct_conn_status=ii[16c]}}";
     return sig && sig[0] == 'i' && strstr(sig, shape) != NULL;
+}
+
+/* isDataPlanEnabled: must return int and take a BOOL pointer. */
+static int share_data_plan_signature(const char *sig) {
+    return sig && sig[0] == 'i' && strstr(sig, "^B") != NULL;
 }
 
 /* Wi-Fi driver channel entry (SIOCGA80211, supported channels). */

@@ -3,7 +3,8 @@
  * In misd it removes the cellular requirement and asks for Apple's local
  * network mode with DHCP; Apple still creates the network. In wifid, on
  * releases with a fixed 2.4 GHz hotspot channel list, it offers 5 GHz
- * channels when the Wi-Fi driver allows them here.
+ * channels when the Wi-Fi driver allows them here. On Wi-Fi-only iPads it
+ * also skips misd's wait for a carrier and lists Personal Hotspot in Settings.
  *
  * Anything unrecognized is left untouched. When something goes wrong, a
  * report is written once to Documents/Share-Report.json. */
@@ -105,6 +106,24 @@ static BOOL write_instruction(void *address, uint32_t value) {
     return YES;
 }
 
+static BOOL write_instructions(void *address, const uint32_t *values, size_t count) {
+    for (size_t i = 0; i < count; i++)
+        if (!write_instruction((uint32_t *)address + i, values[i])) return NO;
+    return YES;
+}
+
+/* Wi-Fi-only models have no baseband node in their device tree. */
+static BOOL has_baseband(void) {
+    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+    mach_port_t (*from_path)(mach_port_t, const char *) = iokit ? dlsym(iokit, "IORegistryEntryFromPath") : NULL;
+    kern_return_t (*release)(mach_port_t) = iokit ? dlsym(iokit, "IOObjectRelease") : NULL;
+    if (!from_path || !release) return YES;
+    mach_port_t entry = from_path(MACH_PORT_NULL, "IODeviceTree:/baseband");
+    if (entry == MACH_PORT_NULL) return NO;
+    release(entry);
+    return YES;
+}
+
 static BOOL hook_function(void *target, void *replacement, void **original) {
     struct { void *function, *replacement, *original, *options; } hook = {target, replacement, original, NULL};
     void (*ms_function)(void *, void *, void **) = hook_symbol("MSHookFunction");
@@ -139,17 +158,19 @@ struct share_ct_status {
 };
 
 static int (*ct_original)(id, SEL, struct share_ct_status *);
+static int (*plan_original)(id, SEL, BOOL *);
+static uint64_t (*data_original)(void *, Boolean *);
 static uint64_t (*mode_original)(void *, const char *);
 static CFStringRef (*sim_status)(void);
 static CFStringRef *sim_ready;
 static _Atomic int local_mode, tethering_result = -1;
-static BOOL compatible, ct_backend;
-static NSString *failure = @"", *signature = @"absent";
+static BOOL compatible, ct_backend, wifi_only;
+static NSString *failure = @"", *signature = @"absent", *plan_signature = @"absent";
 static NSMutableDictionary *binary;
 
-/* No usable SIM: none, locked, or no baseband at all (Wi-Fi-only models
- * report no status). */
+/* No usable SIM: none, locked, or no baseband at all. */
 static int sim_unusable(void) {
+    if (wifi_only) return 1;
     CFStringRef status = sim_status ? sim_status() : NULL;
     return !status || !sim_ready || !*sim_ready || !CFEqual(status, *sim_ready);
 }
@@ -165,6 +186,27 @@ static int ct_status(id self, SEL cmd, struct share_ct_status *s) {
     if (!local || !compatible) return result;
     s->carrier = 1;
     s->auth = 1;
+    return 0;
+}
+
+/* iOS 14 turns the hotspot off when the cellular data plan reads off. With no
+ * cellular connection, report it on so the local network can start. */
+static int plan_status(id self, SEL cmd, BOOL *enabled) {
+    int result = plan_original(self, cmd, enabled);
+    if (!compatible || !enabled || (result == 0 && *enabled)) return result;
+    struct share_ct_status s = {0};
+    int status = ct_original(self, sel_registerName("getTetheringStatus:"), &s);
+    if (status == 0 && (s.available || s.conn.name[0])) return result;
+    *enabled = YES;
+    return 0;
+}
+
+/* iOS 12 asks CoreTelephony directly. The error sits in the upper half of the
+ * returned CTError. */
+static uint64_t data_status(void *connection, Boolean *enabled) {
+    uint64_t result = data_original(connection, enabled);
+    if (!compatible || !enabled || ((result >> 32) == 0 && *enabled) || !sim_unusable()) return result;
+    *enabled = 1;
     return 0;
 }
 
@@ -208,11 +250,16 @@ static void install(void) {
     int destination = 0;
     unsigned sites = text ? share_patch_sites((const uint32_t *)text, size / 4, &site, &destination) : 0;
     unsigned tables = text ? share_mode_tables(text, size) : 0;
+    size_t request_site = 0;
+    uint32_t request_patch[4] = {0};
+    unsigned requests = text ? share_request_sites((const uint32_t *)text, size / 4, &request_site, request_patch) : 0;
+    wifi_only = !has_baseband();
     BOOL local_dhcp = text && tables == 1 && share_contains(text, size, "opMode") &&
         (share_contains(text, size, "local with dhcp mode") || share_contains(text, size, "local_with_dhcp_mode"));
     binary = [@{@"path": path, @"uuid": header ? image_uuid(header) : @"unknown",
                 @"cpu": header ? @[@(header->cputype), @(header->cpusubtype & 0xff)] : @[],
-                @"stateGateMatches": @(sites), @"modeTables": @(tables), @"localDHCPMode": @(local_dhcp)} mutableCopy];
+                @"stateGateMatches": @(sites), @"modeTables": @(tables), @"localDHCPMode": @(local_dhcp),
+                @"requestGateMatches": @(requests), @"baseband": @(!wifi_only)} mutableCopy];
     if (sites == 1) {
         binary[@"stateGateOffset"] = @((uintptr_t)(text + site * 4) - (uintptr_t)header);
         binary[@"stateGateInstruction"] = @(((uint32_t *)text)[site]);
@@ -235,10 +282,18 @@ static void install(void) {
     if (!permission) { failure = @"Cellular check not recognized"; return; }
     if (!mode_lookup) { failure = @"Hotspot mode lookup not found"; return; }
     if (!write_instruction(text + site * 4, share_patched_instruction(destination))) { failure = @"Could not patch misd"; return; }
+    if (wifi_only && requests == 1 && write_instructions(text + request_site * 4, request_patch, 4))
+        binary[@"requestGateOffset"] = @((uintptr_t)(text + request_site * 4) - (uintptr_t)header);
     if (!hook_function(mode_lookup, (void *)mode_get, (void **)&mode_original)) { failure = @"Hooking framework unavailable"; return; }
     if (ct_backend) ct_original = (void *)method_setImplementation(method, (IMP)ct_status);
     compatible = !ct_backend || ct_original != NULL;
-    if (!compatible) failure = @"Could not adapt the cellular check";
+    if (!compatible) { failure = @"Could not adapt the cellular check"; return; }
+    void *data_check = !ct_backend && telephony ? dlsym(telephony, "_CTServerConnectionGetCellularDataIsEnabled") : NULL;
+    if (data_check) hook_function(data_check, (void *)data_status, (void **)&data_original);
+    Method plan = ct_backend ? class_getInstanceMethod(client, sel_registerName("isDataPlanEnabled:")) : NULL;
+    const char *plan_types = plan ? method_getTypeEncoding(plan) : NULL;
+    if (plan_types) plan_signature = @(plan_types);
+    if (share_data_plan_signature(plan_types)) plan_original = (void *)method_setImplementation(plan, (IMP)plan_status);
 }
 
 /* ── Report ───────────────────────────────────────────────────────
@@ -315,6 +370,7 @@ static void report(NSString *kind, NSString *detail) {
         @"engine": @{@"compatible": @(compatible), @"failure": failure,
                      @"cellularCheck": ct_backend ? @"CoreTelephony" : @"SIM status",
                      @"tetheringStatusSignature": signature, @"tetheringStatusResult": @(atomic_load(&tethering_result)),
+                     @"dataPlanSignature": plan_signature, @"dataPlanHook": @(plan_original != NULL || data_original != NULL),
                      @"localMode": @(atomic_load(&local_mode)), @"patch": patch_method, @"hook": hook_method,
                      @"hookFrameworks": @{@"MSHookFunction": @(hook_symbol("MSHookFunction") != NULL),
                                           @"MSHookMemory": @(hook_symbol("MSHookMemory") != NULL),
@@ -417,9 +473,62 @@ static void start_wifid(void) {
     });
 }
 
+/* ── Settings ─────────────────────────────────────────────────────
+ * Wi-Fi-only models lack the personal-hotspot capability, so Settings hides
+ * Personal Hotspot. MGCopyAnswer is `mov x1, #0; b answer`, and
+ * MGGetBoolAnswer calls the same answer function, so one hook covers both. */
+static CFTypeRef (*answer_original)(CFStringRef, void *);
+
+/* MGGetBoolAnswer passes a pointer the answer function fills with the value's
+ * type, so the original always runs and only the value is replaced. */
+static CFTypeRef answer(CFStringRef key, void *options) {
+    CFTypeRef value = answer_original(key, options);
+    if (!value || CFGetTypeID(value) != CFBooleanGetTypeID() || !key ||
+        CFGetTypeID(key) != CFStringGetTypeID() || !CFEqual(key, CFSTR("personal-hotspot")))
+        return value;
+    CFRelease(value);
+    return CFRetain(kCFBooleanTrue);
+}
+
+/* The Personal Hotspot row also requires cellular-data. Settings.plist is
+ * edited as it loads, for that row only, so no other cellular screen appears. */
+static id (*plist_original)(NSDictionary *, id, id, NSString *, NSBundle *, void *, void *, id, void *);
+
+static id plist_specifiers(NSDictionary *plist, id parent, id target, NSString *name, NSBundle *bundle,
+                           void *title, void *identifier, id list, void *controllers) {
+    NSArray *items = [plist isKindOfClass:[NSDictionary class]] ? plist[@"items"] : nil;
+    NSUInteger index = [items isKindOfClass:[NSArray class]] ?
+        [items indexOfObjectPassingTest:^BOOL(id item, NSUInteger i, BOOL *stop) {
+            return [item isKindOfClass:[NSDictionary class]] &&
+                [item[@"id"] isEqual:@"INTERNET_TETHERING"] && item[@"requiredCapabilities"];
+        }] : NSNotFound;
+    if (index != NSNotFound) {
+        NSMutableDictionary *item = [items[index] mutableCopy];
+        [item removeObjectForKey:@"requiredCapabilities"];
+        NSMutableArray *edited = [items mutableCopy];
+        edited[index] = item;
+        NSMutableDictionary *copy = [plist mutableCopy];
+        copy[@"items"] = edited;
+        plist = copy;
+    }
+    return plist_original(plist, parent, target, name, bundle, title, identifier, list, controllers);
+}
+
+static void start_settings(void) {
+    if (has_baseband()) return;
+    void *preferences = dlopen("/System/Library/PrivateFrameworks/Preferences.framework/Preferences", RTLD_NOW);
+    void *loader = preferences ? dlsym(preferences, "SpecifiersFromPlist") : NULL;
+    if (loader) hook_function(loader, (void *)plist_specifiers, (void **)&plist_original);
+    void *gestalt = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_NOW);
+    const uint32_t *copy = gestalt ? dlsym(gestalt, "MGCopyAnswer") : NULL;
+    if (!copy || copy[0] != 0xd2800001u || copy[1] != 0x14000001u) return;
+    hook_function((void *)(copy + 2), (void *)answer, (void **)&answer_original);
+}
+
 __attribute__((constructor)) static void share_init(void) {
     const char *name = getprogname();
     BOOL misd = !strcmp(name, "misd"), wifid = !strcmp(name, "wifid");
+    if (!strcmp(name, "Preferences")) { start_settings(); return; }
     if (!misd && !wifid) return;
     queue = dispatch_queue_create("com.rostane.share", DISPATCH_QUEUE_SERIAL);
     @autoreleasepool {
