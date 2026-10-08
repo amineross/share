@@ -35,6 +35,10 @@ static void rules(void) {
     assert(patched[0] == 0x6a080309 && patched[1] == 0x52807f88 && patched[2] == 0x0b090509 && patched[3] == 0xd503201f);
     gate[3] = 0x1a881509;
     assert(share_request_sites(gate, 4, &site, patched) == 0);
+    uint32_t ios12[] = {0xd2800001, 0x14000001}, ios17[] = {0xd2800001, 0x17fffdb4}, other[] = {0xd503237f, 0x14000001};
+    assert(share_answer_branch(ios12) == 4);
+    assert(share_answer_branch(ios17) == -0x930);
+    assert(share_answer_branch(other) == 0);
     assert(share_tethering_signature(sig));
     assert(!share_tethering_signature("v24@0:8^{mis_ctinterface_tethering_status=BBBI{mis_ctinterface_ct_conn_status=ii[16c]}}16"));
     assert(!share_tethering_signature("i24@0:8^{mis_ctinterface_tethering_status=BBBQ{mis_ctinterface_ct_conn_status=ii[16c]}}16"));

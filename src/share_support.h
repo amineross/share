@@ -68,6 +68,15 @@ static unsigned share_request_sites(const uint32_t *w, size_t count, size_t *sit
     return found;
 }
 
+/* MGCopyAnswer is `mov x1, #0` then `b answer`. Returns the byte offset of
+ * `answer` from the `b`, or 0 when the function has another shape. */
+static int64_t share_answer_branch(const uint32_t *w) {
+    if (w[0] != 0xd2800001u || (w[1] & 0xfc000000u) != 0x14000000u) return 0;
+    int64_t imm = w[1] & 0x03ffffffu;
+    if (imm & 0x02000000) imm -= 0x04000000;
+    return imm * 4;
+}
+
 /* misd's operating-mode table; 203 is Apple's local network with DHCP. */
 static unsigned share_mode_tables(const void *bytes, size_t size) {
     const uint32_t table[] = {201, 201, 202, 203};

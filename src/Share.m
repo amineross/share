@@ -24,6 +24,7 @@
 #include <ifaddrs.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include <ptrauth.h>
 #include "share_support.h"
 
 #ifndef SHARE_VERSION
@@ -35,7 +36,10 @@
 #define SHARE_RADIO SHARE_DIR "/radio.json"
 #define SHARE_REPORT "/var/mobile/Documents/Share-Report.json"
 #define MIS_KEY CFSTR("com.apple.MobileInternetSharing")
+#define MIS_STATE_RESET 1020
 #define MIS_STATE_RESETTING 1021
+#define MIS_STATE_ON 1023
+#define MIS_SETTINGS "/var/mobile/Library/Preferences/com.apple.MobileInternetSharing.plist"
 #define MOBILE_UID 501
 
 extern const char *getprogname(void);
@@ -122,6 +126,27 @@ static BOOL has_baseband(void) {
     if (entry == MACH_PORT_NULL) return NO;
     release(entry);
     return YES;
+}
+
+/* misd restores its saved state at launch and skips the request gate when
+ * that state is already AUTH_UNKNOWN (1021), so a device that once stopped
+ * there (any build without the request-gate patch) stays there. Start such a
+ * device from RESET instead; misd reads the file after this constructor. */
+static void reset_saved_state(void) {
+    NSData *data = [NSData dataWithContentsOfFile:@MIS_SETTINGS];
+    if (!data) return;
+    NSPropertyListFormat format = NSPropertyListBinaryFormat_v1_0;
+    NSMutableDictionary *settings = [NSPropertyListSerialization propertyListWithData:data
+        options:NSPropertyListMutableContainers format:&format error:NULL];
+    if (![settings isKindOfClass:[NSMutableDictionary class]] ||
+        [settings[@"State"] intValue] != MIS_STATE_RESETTING) return;
+    struct stat info;
+    if (stat(MIS_SETTINGS, &info) != 0) return;
+    settings[@"State"] = @(MIS_STATE_RESET);
+    NSData *updated = [NSPropertyListSerialization dataWithPropertyList:settings format:format options:0 error:NULL];
+    if (![updated writeToFile:@MIS_SETTINGS atomically:YES]) return;
+    chown(MIS_SETTINGS, info.st_uid, info.st_gid);
+    chmod(MIS_SETTINGS, info.st_mode & 07777);
 }
 
 static BOOL hook_function(void *target, void *replacement, void **original) {
@@ -282,8 +307,10 @@ static void install(void) {
     if (!permission) { failure = @"Cellular check not recognized"; return; }
     if (!mode_lookup) { failure = @"Hotspot mode lookup not found"; return; }
     if (!write_instruction(text + site * 4, share_patched_instruction(destination))) { failure = @"Could not patch misd"; return; }
-    if (wifi_only && requests == 1 && write_instructions(text + request_site * 4, request_patch, 4))
+    if (wifi_only && requests == 1 && write_instructions(text + request_site * 4, request_patch, 4)) {
         binary[@"requestGateOffset"] = @((uintptr_t)(text + request_site * 4) - (uintptr_t)header);
+        reset_saved_state();
+    }
     if (!hook_function(mode_lookup, (void *)mode_get, (void **)&mode_original)) { failure = @"Hooking framework unavailable"; return; }
     if (ct_backend) ct_original = (void *)method_setImplementation(method, (IMP)ct_status);
     compatible = !ct_backend || ct_original != NULL;
@@ -383,7 +410,8 @@ static void report(NSString *kind, NSString *detail) {
 }
 
 /* Settings shows Personal Hotspot only from State > 1021; misd also
- * publishes an error number when the hotspot fails. */
+ * publishes an error number when the hotspot fails. iOS 14 publishes OFF with
+ * error 45 and no reason, so an error counts only when ON or with a reason. */
 static BOOL check_pending;
 
 static void check_hotspot(void) {
@@ -392,7 +420,8 @@ static void check_hotspot(void) {
     if (!state.count) return;
     if ([state[@"State"] intValue] <= MIS_STATE_RESETTING)
         report(@"hotspot unavailable", [NSString stringWithFormat:@"misd stays in state %@", state[@"State"]]);
-    else if ([state[@"Errnum"] intValue] != 0)
+    else if ([state[@"Errnum"] intValue] != 0 &&
+             ([state[@"State"] intValue] == MIS_STATE_ON || [state[@"Reason"] intValue] != 0))
         report(@"hotspot error", [NSString stringWithFormat:@"misd reported error %@", state[@"Errnum"]]);
 }
 
@@ -514,15 +543,31 @@ static id plist_specifiers(NSDictionary *plist, id parent, id target, NSString *
     return plist_original(plist, parent, target, name, bundle, title, identifier, list, controllers);
 }
 
+/* Preferences checks a row's capabilities in one call. Rows that need
+ * personal-hotspot are the Personal Hotspot ones. */
+static BOOL (*capabilities_original)(NSArray *);
+
+static BOOL capabilities(NSArray *required) {
+    if ([required isKindOfClass:[NSArray class]] && [required containsObject:@"personal-hotspot"]) return YES;
+    return capabilities_original(required);
+}
+
 static void start_settings(void) {
     if (has_baseband()) return;
     void *preferences = dlopen("/System/Library/PrivateFrameworks/Preferences.framework/Preferences", RTLD_NOW);
     void *loader = preferences ? dlsym(preferences, "SpecifiersFromPlist") : NULL;
     if (loader) hook_function(loader, (void *)plist_specifiers, (void **)&plist_original);
+    void *check = preferences ? dlsym(preferences, "SystemHasCapabilities") : NULL;
+    if (check) hook_function(check, (void *)capabilities, (void **)&capabilities_original);
     void *gestalt = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_NOW);
-    const uint32_t *copy = gestalt ? dlsym(gestalt, "MGCopyAnswer") : NULL;
-    if (!copy || copy[0] != 0xd2800001u || copy[1] != 0x14000001u) return;
-    hook_function((void *)(copy + 2), (void *)answer, (void **)&answer_original);
+    void *copy = gestalt ? dlsym(gestalt, "MGCopyAnswer") : NULL;
+    /* On arm64e dlsym returns a signed pointer; read the code through a plain one. */
+    const uint32_t *code = copy ? ptrauth_strip(copy, ptrauth_key_function_pointer) : NULL;
+    int64_t offset = code ? share_answer_branch(code) : 0;
+    if (!offset) return;
+    void *target = (void *)((const char *)(code + 1) + offset);
+    target = ptrauth_sign_unauthenticated(target, ptrauth_key_function_pointer, 0);
+    hook_function(target, (void *)answer, (void **)&answer_original);
 }
 
 __attribute__((constructor)) static void share_init(void) {
