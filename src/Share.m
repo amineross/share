@@ -10,6 +10,7 @@
  * report is written once to Documents/Share-Report.json. */
 #import <Foundation/Foundation.h>
 #include <objc/runtime.h>
+#include <objc/message.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <mach/mach.h>
@@ -38,6 +39,7 @@
 #define MIS_KEY CFSTR("com.apple.MobileInternetSharing")
 #define MIS_STATE_RESET 1020
 #define MIS_STATE_RESETTING 1021
+#define MIS_STATE_OFF 1022
 #define MIS_STATE_ON 1023
 #define MIS_SETTINGS "/var/mobile/Library/Preferences/com.apple.MobileInternetSharing.plist"
 #define MOBILE_UID 501
@@ -552,8 +554,24 @@ static BOOL capabilities(NSArray *required) {
     return capabilities_original(required);
 }
 
+/* iOS 12 misd leaves RESET only when a client asks for a state; on cellular
+ * models a carrier event does it. A restored Wi-Fi-only iPad has neither, and
+ * Settings hides Personal Hotspot in RESET. Ask for OFF, as the switch would. */
+static void request_off(void) {
+    dlopen("/System/Library/PreferenceBundles/WirelessModemSettings.bundle/WirelessModemSettings", RTLD_NOW);
+    Class manager_class = objc_getClass("MISManager");
+    SEL shared = sel_registerName("sharedManager"), get = sel_registerName("getState:andReason:"),
+        set = sel_registerName("setState:");
+    id manager = [manager_class respondsToSelector:shared] ? ((id (*)(id, SEL))objc_msgSend)(manager_class, shared) : nil;
+    if (![manager respondsToSelector:get] || ![manager respondsToSelector:set]) return;
+    int state = 0, reason = 0;
+    ((void (*)(id, SEL, int *, int *))objc_msgSend)(manager, get, &state, &reason);
+    if (state == MIS_STATE_RESET) ((void (*)(id, SEL, int))objc_msgSend)(manager, set, MIS_STATE_OFF);
+}
+
 static void start_settings(void) {
     if (has_baseband()) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ @autoreleasepool { @try { request_off(); } @catch (id e) {} } });
     void *preferences = dlopen("/System/Library/PrivateFrameworks/Preferences.framework/Preferences", RTLD_NOW);
     void *loader = preferences ? dlsym(preferences, "SpecifiersFromPlist") : NULL;
     if (loader) hook_function(loader, (void *)plist_specifiers, (void **)&plist_original);
