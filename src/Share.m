@@ -24,6 +24,7 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <ifaddrs.h>
+#include <netinet/in.h>
 #include <unistd.h>
 #include <stdatomic.h>
 #include <ptrauth.h>
@@ -199,6 +200,8 @@ static int (*carrier_original)(int, Boolean *);
 static uint64_t (*mode_original)(void *, const char *);
 static CFStringRef (*sim_status)(void);
 static CFStringRef *sim_ready;
+static CFStringRef (*registration)(void);
+static CFStringRef *registered_home, *registered_roaming;
 static _Atomic int local_mode, tethering_result = -1, carrier_result = -1, carrier_overrides;
 static BOOL compatible, ct_backend, wifi_only;
 static NSString *failure = @"", *signature = @"absent", *plan_signature = @"absent";
@@ -208,14 +211,42 @@ static void *load_telephony(void) {
     void *telephony = dlopen("/System/Library/Frameworks/CoreTelephony.framework/CoreTelephony", RTLD_NOW);
     sim_status = telephony ? dlsym(telephony, "CTSIMSupportGetSIMStatus") : NULL;
     sim_ready = telephony ? dlsym(telephony, "kCTSIMSupportSIMStatusReady") : NULL;
+    registration = telephony ? dlsym(telephony, "CTRegistrationGetStatus") : NULL;
+    registered_home = telephony ? dlsym(telephony, "kCTRegistrationStatusRegisteredHome") : NULL;
+    registered_roaming = telephony ? dlsym(telephony, "kCTRegistrationStatusRegisteredRoaming") : NULL;
     return telephony;
 }
 
-/* No usable SIM: none, locked, or no baseband at all. */
+/* A SIM that never registers (an expired card, or a 3G-only one where 3G
+ * was switched off) still reads Ready. Found by #40 and Simon in Brisbane. */
+static int sim_unregistered(void) {
+    CFStringRef status = registration ? registration() : NULL;
+    if (!status || !registered_home || !*registered_home || !registered_roaming || !*registered_roaming) return 0;
+    return !CFEqual(status, *registered_home) && !CFEqual(status, *registered_roaming);
+}
+
+/* No usable SIM: none, locked, not registered, or no baseband at all. */
 static int sim_unusable(void) {
     if (wifi_only) return 1;
     CFStringRef status = sim_status ? sim_status() : NULL;
-    return !status || !sim_ready || !*sim_ready || !CFEqual(status, *sim_ready);
+    return !status || !sim_ready || !*sim_ready || !CFEqual(status, *sim_ready) || sim_unregistered();
+}
+
+/* Some carriers give cellular data IPv6 only, and hotspot clients then never
+ * get an IPv4 address (#28). Only an interface that is up with IPv6 and no
+ * IPv4 counts, so a tethering connection still coming up is left alone. */
+static int ipv6_only(const char *name) {
+    struct ifaddrs *list = NULL;
+    int ipv4 = 0, ipv6 = 0;
+    if (!name[0] || getifaddrs(&list) != 0) return 0;
+    for (struct ifaddrs *i = list; i; i = i->ifa_next) {
+        if (strncmp(i->ifa_name, name, IFNAMSIZ) || !i->ifa_addr || !(i->ifa_flags & IFF_UP)) continue;
+        if (i->ifa_addr->sa_family == AF_INET) ipv4 = 1;
+        if (i->ifa_addr->sa_family == AF_INET6 &&
+            !IN6_IS_ADDR_LINKLOCAL(&((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr)) ipv6 = 1;
+    }
+    freeifaddrs(list);
+    return ipv6 && !ipv4;
 }
 
 /* CoreTelephony states that no SIM is usable (not inserted, locked).
@@ -233,7 +264,9 @@ static int ct_status(id self, SEL cmd, struct share_ct_status *s) {
     int result = ct_original(self, cmd, s);
     atomic_store(&tethering_result, result);
     if (!s) return result;
-    int local = result != 0 || (!s->available && !s->conn.name[0]);
+    char name[sizeof s->conn.name + 1] = {0};
+    memcpy(name, s->conn.name, sizeof s->conn.name);
+    int local = result != 0 || (!s->available && !name[0]) || ipv6_only(name);
     atomic_store(&local_mode, local);
     if (!local || !compatible) return result;
     s->carrier = 1;
@@ -568,20 +601,63 @@ static unsigned driver_channels(struct apple80211_channels *result) {
     return ok ? MIN(result->count, 64u) : 0;
 }
 
+/* Some radios list 5 GHz channels but never start an access point there:
+ * wifid logs "hostap never started" (-3905) and no client sees the network
+ * (share #5, #6, #7, mostly A7 iPads; others with the same chip work). When
+ * that happens once, this device keeps 2.4 GHz. Delete the file to retry. */
+#define SHARE_KEEP_24GHZ SHARE_DIR "/keep-2.4ghz"
+
+static BOOL keep_24ghz(void) { return access(SHARE_KEEP_24GHZ, F_OK) == 0; }
+
 static void choose_band(void) {
     struct apple80211_channels driver;
     unsigned count = driver_channels(&driver);
     uint32_t five[3];
-    unsigned picked = share_pick_5ghz(driver.channels, count, five);
+    unsigned picked = keep_24ghz() ? 0 : share_pick_5ghz(driver.channels, count, five);
     memcpy(channel_list, picked ? five : share_stock_channels, sizeof share_stock_channels);
     NSMutableArray *offered = [NSMutableArray array];
     for (unsigned i = 0; i < count; i++) [offered addObject:@[@(driver.channels[i].channel), @(driver.channels[i].flags)]];
     write_mobile_file(SHARE_RADIO, json(@{@"hotspotChannels": @[@(channel_list[0]), @(channel_list[1]), @(channel_list[2])],
-                                          @"driverChannels": offered}));
+                                          @"keep24GHz": @(keep_24ghz()), @"driverChannels": offered}));
+}
+
+static BOOL hotspot_network_up(void) {
+    NSDictionary *bridge = interfaces()[@"bridge100"];
+    return [bridge[@"up"] boolValue] && [bridge[@"ipv4"] boolValue];
+}
+
+/* Called when the hotspot leaves OFF on 5 GHz. A started access point
+ * brings bridge100 up within a few seconds. Decide before Showcase retries
+ * the hotspot at 15 s, so its second attempt already uses 2.4 GHz. */
+static void watch_5ghz_start(void) {
+    static BOOL watching;
+    if (watching || channel_list[0] <= 14) return;
+    watching = YES;
+    for (int second = 2; second <= 12; second += 2) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, second * NSEC_PER_SEC), queue, ^{
+            if (!watching) return;
+            if (hotspot_network_up()) { watching = NO; return; }
+            if (second < 12) return;
+            watching = NO;
+            /* Back to OFF may just be the user cancelling; only a hotspot
+             * still trying to start counts. */
+            if ([hotspot_state()[@"State"] intValue] == MIS_STATE_OFF) return;
+            write_mobile_file(SHARE_KEEP_24GHZ, [NSData data]);
+            @autoreleasepool { @try { choose_band(); } @catch (id e) {} }
+        });
+    }
 }
 
 static void wifid_state_changed(CFTypeRef s, CFArrayRef keys, void *info) {
-    @autoreleasepool { @try { choose_band(); } @catch (id e) {} }
+    static int last;
+    @autoreleasepool {
+        @try {
+            int state = [hotspot_state()[@"State"] intValue];
+            if (last == MIS_STATE_OFF && state != MIS_STATE_OFF) watch_5ghz_start();
+            if (state) last = state;
+            choose_band();
+        } @catch (id e) {}
+    }
 }
 
 static void start_wifid(void) {
