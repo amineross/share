@@ -125,8 +125,11 @@ static void share_x0_load(uint64_t pc, uint64_t target, uint32_t out[2]) {
 
 /* iOS 18 Settings reads each MobileGestalt capability through a Swift
  * key-path getter:
- *   stp; stp; add x29; mov x19, x8; ldr x0, [x0]; bl accessor; strb w0, [x19]
- * Returns the getter that calls `stub`, or 0 unless exactly one does. */
+ *   [pacibsp;] stp; stp; add x29; mov x19, x8; ldr x0, [x0]; bl accessor; strb w0, [x19]
+ * The key-path pattern points at the function's entry. On arm64e that entry is
+ * the leading `pacibsp` (iOS 18.4 and up), so include it; without it the entry
+ * is the first `stp`. Returns the getter that calls `stub`, or 0 unless exactly
+ * one does. */
 static uint64_t share_capability_getter(const uint32_t *w, size_t count, uint64_t base, uint64_t stub) {
     uint64_t getter = 0;
     unsigned found = 0;
@@ -134,7 +137,9 @@ static uint64_t share_capability_getter(const uint32_t *w, size_t count, uint64_
     for (size_t i = 5; i + 1 < count; i++)
         if (w[i - 2] == 0xaa0803f3u && w[i - 1] == 0xf9400000u && w[i + 1] == 0x39000260u &&
             share_bl_target(w[i], base + i * 4) == stub) {
-            getter = base + (i - 5) * 4;
+            size_t start = i - 5;
+            if (start >= 1 && w[start - 1] == 0xd503237fu) start--;  /* leading pacibsp */
+            getter = base + start * 4;
             found++;
         }
     return found == 1 ? getter : 0;

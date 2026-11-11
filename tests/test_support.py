@@ -17,7 +17,12 @@ MISD = {'ios12': (0x1182c, 24), 'ios14ipad': (0x11bb8, 25), 'ios15': (0x120a8, 2
 # cellular-data load, the personal-hotspot pattern; __got (address, size).
 SETTINGS = {'ios18ipad': ((0x3b88, 0x100003b88, 0x10d81c), (0x1155d0, 0x1001155d0, 0x9bd8),
                           (0x1001139d8, 0x100113a2c, 0x100114098), 0x10002b264, 0x100116cb8,
-                          (0x100154000, 0x3830))}
+                          (0x100154000, 0x3830)),
+            # iOS 18.4 (22E240), iPad Wi-Fi (MYLE2LL/A), arm64e. Getters begin
+            # with pacibsp, so the key-path points one instruction earlier.
+            'ios18_4': ((0x3c28, 0x100003c28, 0x14ecf8), (0x157af0, 0x100157af0, 0x93a8),
+                        (0x100155bf0, 0x100155c60, 0x1001564e0), 0x100035034, 0x100158fb8,
+                        (0x100194000, 0x1f90))}
 # iOS 12 misd's carrier check (offset); later releases ask an Objective-C client.
 CARRIER = {'ios12': 0xb910, 'ios14ipad': 0, 'ios15': 0, 'ios16': 0, 'ios17': 0, 'ios18ipad': 0}
 WIFID = {'ios12': 1, 'ios14ipad': 0, 'ios15': 0, 'ios16': 0, 'ios17': 0, 'ios18ipad': 0}
@@ -72,6 +77,12 @@ static void rules(void) {
     size_t first = 0, last = 0;
     assert(share_references(refs, 3, 0x1000, 0x1008, &first, &last) == 2 && first == 0 && last == 1);
     uint32_t out[3];
+    /* Capability getter; bl at index 6 targets 0x1100. arm64e adds a leading pacibsp. */
+    uint32_t getter[] = {0xd65f03c0, 0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xaa0803f3, 0xf9400000, 0x9400003a, 0x39000260};
+    assert(share_capability_getter(getter, 8, 0x1000, 0x1100) == 0x1004);
+    getter[0] = 0xd503237f;
+    assert(share_capability_getter(getter, 8, 0x1000, 0x1100) == 0x1000);
+    assert(share_capability_getter(getter, 8, 0x1000, 0x1104) == 0);
     struct share_channel all[] = {{1, 6, 0x0a}, {1, 36, 0x12}, {1, 40, 0x12}, {1, 44, 0x12}, {1, 52, 0x112}};
     assert(share_pick_5ghz(all, 5, out) == 3 && out[0] == 36 && out[1] == 40 && out[2] == 44);
     struct share_channel some[] = {{1, 11, 0x0a}, {1, 44, 0x12}, {1, 100, 0x112}};
