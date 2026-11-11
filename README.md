@@ -8,7 +8,7 @@ Install it, open Settings › Personal Hotspot, set a password and turn it on. D
 
 iOS 12 and up, on iPhone and iPad, rootful or rootless. Wi-Fi-only iPads work too, including iOS 18.
 
-Tested on iOS 12.5.8, 15.8.4, 15.8.5, 15.8.6, 16.3, 16.6.1, 17.6.1 and 17.7.11.
+Tested on iOS 12.5.8, 15.8.4, 15.8.5, 15.8.6, 16.3, 16.6.1, 17.6.1, 17.7.11 and 18.4.
 
 ## 5 GHz
 
